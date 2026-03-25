@@ -1,0 +1,16 @@
+{
+  "name": "ghl-onboarding-tool",
+  "version": "1.0.0",
+  "description": "GHL Client Onboarding Automation - builds full funnel from Master Snapshot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "onboard": "node onboard.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "googleapis": "^140.0.0"
+  }
+}
