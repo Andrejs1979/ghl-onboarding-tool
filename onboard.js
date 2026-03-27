@@ -3,7 +3,7 @@
 require('dotenv').config();
 
 const ghl = require('./ghl');
-const { parseSalesCopyFromDoc, parseSalesCopyDoc } = require('./gdocs');
+const { parseOfferFolder, parseBackendFolder, parseSalesCopyFromDoc, parseSalesCopyDoc } = require('./gdocs');
 
 const API_KEY = process.env.GHL_API_KEY;
 const SNAPSHOT_ID = process.env.MASTER_SNAPSHOT_ID;
@@ -44,16 +44,26 @@ async function onboardClient(clientData, log = console.log) {
     // Wait a moment for snapshot to propagate
     await sleep(3000);
 
-    // ── STEP 3: Parse sales copy from Google Doc ──────────────
-    log('📄 Step 3: Parsing sales copy from Google Doc...');
+    // ── STEP 3: Parse sales copy from Google Drive folders ────
+    log('📄 Step 3: Parsing sales copy from Google Drive...');
     let salesData = {};
 
-    if (clientData.salesCopyDocUrl) {
+    // Primary: parse from Drive folders (Steve's GHL form submits folder URLs)
+    if (clientData.offerFolderUrl) {
+      try {
+        salesData = await parseOfferFolder(clientData.offerFolderUrl);
+        log(`  ✓ Offer folder parsed: ${Object.keys(salesData).length} fields`);
+      } catch (err) {
+        log(`  ⚠ Offer folder parse failed (${err.message}) — using form fields`);
+        salesData = extractSalesDataFromForm(clientData);
+      }
+    } else if (clientData.salesCopyDocUrl) {
+      // Legacy: single doc URL
       try {
         salesData = await parseSalesCopyFromDoc(clientData.salesCopyDocUrl);
         log(`  ✓ Parsed ${Object.keys(salesData).length} fields from Google Doc`);
       } catch (err) {
-        log(`  ⚠ Google Doc parse failed (${err.message}) — using form fields instead`);
+        log(`  ⚠ Google Doc parse failed (${err.message}) — using form fields`);
         salesData = extractSalesDataFromForm(clientData);
       }
     } else {
@@ -61,39 +71,80 @@ async function onboardClient(clientData, log = console.log) {
       log('  ✓ Using form-provided sales data');
     }
 
+    // Supplement with Backend Engine folder (upsell pages)
+    if (clientData.backendFolderUrl) {
+      try {
+        const backendData = await parseBackendFolder(clientData.backendFolderUrl);
+        Object.assign(salesData, backendData);
+        log(`  ✓ Backend folder parsed: ${Object.keys(backendData).length} additional fields`);
+      } catch (err) {
+        log(`  ⚠ Backend folder parse failed (${err.message}) — skipping upsells`);
+      }
+    }
+
+    // Apply price override if provided directly in form
+    if (clientData.price && !salesData.mainProductPrice) {
+      salesData.mainProductPrice = clientData.price;
+    }
+    // Apply VSL link
+    if (clientData.vslLink) {
+      salesData.vslLink = clientData.vslLink;
+    }
+
     results.steps.push({ step: 3, label: 'Sales copy parsed', status: 'ok', data: salesData });
 
-    // ── STEP 4: Set custom values (funnel variables) ──────────
-    log('🔧 Step 4: Setting funnel custom values...');
-    const customValues = buildCustomValuesMap(clientData, salesData);
-    await ghl.setCustomValues(API_KEY, location.id, customValues);
-    results.steps.push({ step: 4, label: 'Custom values set', status: 'ok', data: { count: Object.keys(customValues).length } });
-    log(`  ✓ Set ${Object.keys(customValues).length} custom values`);
+    // Save salesData in results for the /api/complete flow
+    results.salesData = salesData;
 
-    // ── STEP 5: Create products ───────────────────────────────
-    log('🛍 Step 5: Creating products...');
-    const products = await setupProducts(API_KEY, location.id, salesData);
-    results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
-    log(`  ✓ Created ${products.length} products`);
+    // ── STEPS 4-6: Try with agency key first, fall back to "needs token" ──
+    try {
+      // ── STEP 4: Set custom values (funnel variables) ──────────
+      log('🔧 Step 4: Setting funnel custom values...');
+      const customValues = buildCustomValuesMap(clientData, salesData);
+      await ghl.setCustomValues(API_KEY, location.id, customValues);
+      results.steps.push({ step: 4, label: 'Custom values set', status: 'ok', data: { count: Object.keys(customValues).length } });
+      log(`  ✓ Set ${Object.keys(customValues).length} custom values`);
 
-    // ── STEP 6: Create thank you emails ───────────────────────
-    log('📧 Step 6: Creating post-purchase emails...');
-    const emails = await setupEmails(API_KEY, location.id, salesData, clientData);
-    results.steps.push({ step: 6, label: 'Thank you emails created', status: 'ok', data: emails });
-    log(`  ✓ Created ${emails.length} email templates`);
+      // ── STEP 5: Create products ───────────────────────────────
+      log('🛍 Step 5: Creating products...');
+      const products = await setupProducts(API_KEY, location.id, salesData);
+      results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
+      log(`  ✓ Created ${products.length} products`);
+
+      // ── STEP 6: Create thank you emails ───────────────────────
+      log('📧 Step 6: Creating post-purchase emails...');
+      const emails = await setupEmails(API_KEY, location.id, salesData, clientData);
+      results.steps.push({ step: 6, label: 'Thank you emails created', status: 'ok', data: emails });
+      log(`  ✓ Created ${emails.length} email templates`);
+    } catch (scopeErr) {
+      // Agency key may not have sub-account level scopes — mark for completion with sub-account token
+      log(`  ⚠ Steps 4-6 need sub-account token: ${scopeErr.message}`);
+      results.steps.push({ step: 4, label: 'Custom values — pending sub-account token', status: 'pending' });
+      results.steps.push({ step: 5, label: 'Products — pending sub-account token', status: 'pending' });
+      results.steps.push({ step: 6, label: 'Emails — pending sub-account token', status: 'pending' });
+      results.needsLocationToken = true;
+      results.manualStepsNeeded = true;
+    }
 
     // ── STEP 7: Set domain (if provided) ─────────────────────
     if (clientData.domain) {
-      log('🌐 Step 7: Setting up domain...');
-      await ghl.updateLocationSettings(API_KEY, location.id, {
-        domain: clientData.domain,
-      });
-      results.steps.push({ step: 7, label: 'Domain configured', status: 'ok', data: { domain: clientData.domain } });
-      log(`  ✓ Domain: ${clientData.domain}`);
+      try {
+        log('🌐 Step 7: Setting up domain...');
+        await ghl.updateLocationSettings(API_KEY, location.id, {
+          domain: clientData.domain,
+        });
+        results.steps.push({ step: 7, label: 'Domain configured', status: 'ok', data: { domain: clientData.domain } });
+        log(`  ✓ Domain: ${clientData.domain}`);
+      } catch (domainErr) {
+        results.steps.push({ step: 7, label: 'Domain — set up CNAME first', status: 'warning' });
+        log(`  ⚠ Domain: ${domainErr.message}`);
+      }
     }
 
-    results.status = 'complete';
-    results.message = `✅ Onboarding complete! Location: ${results.locationUrl}`;
+    results.status = results.needsLocationToken ? 'complete_partial' : 'complete';
+    results.message = results.needsLocationToken
+      ? `⚠ Partial — sub-account created, paste token to complete setup. Location: ${results.locationUrl}`
+      : `✅ Onboarding complete! Location: ${results.locationUrl}`;
     log(`\n${results.message}`);
 
   } catch (err) {
@@ -148,6 +199,7 @@ function buildCustomValuesMap(clientData, salesData) {
     // Sales page copy
     'Sales Headline': salesData.salesHeadline || '',
     'Sales Subheadline': salesData.salesSubheadline || '',
+    'VSL Link': salesData.vslLink || clientData.vslLink || '',
 
     // Main product
     'Product Name': salesData.mainProductName || clientData.productName || '',
@@ -224,35 +276,30 @@ async function setupEmails(apiKey, locationId, salesData, clientData) {
     {
       name: 'Thank You - Main Product',
       subject: salesData.thankYouEmailSubject || `Thank you for your purchase of ${salesData.mainProductName || 'our product'}!`,
-      body: buildThankYouEmailBody({
-        productName: salesData.mainProductName,
-        downloadUrl: salesData.downloadUrl,
-        fromName,
-      }),
+      // Use parsed email body from Google Doc if available; fall back to generated template
+      body: salesData.thankYouEmailBody
+        ? wrapEmailBody(salesData.thankYouEmailBody, salesData.downloadUrl)
+        : buildThankYouEmailBody({ productName: salesData.mainProductName, downloadUrl: salesData.downloadUrl, fromName }),
     },
   ];
 
-  if (salesData.upsell1Name) {
+  if (salesData.upsell1Name || salesData.upsell1ThankYouBody) {
     emailTemplates.push({
       name: 'Thank You - Upsell 1',
-      subject: `Thank you for adding ${salesData.upsell1Name}!`,
-      body: buildThankYouEmailBody({
-        productName: salesData.upsell1Name,
-        downloadUrl: salesData.upsell1DownloadUrl,
-        fromName,
-      }),
+      subject: salesData.upsell1ThankYouSubject || `Thank you for adding ${salesData.upsell1Name || 'your upsell'}!`,
+      body: salesData.upsell1ThankYouBody
+        ? wrapEmailBody(salesData.upsell1ThankYouBody, salesData.upsell1DownloadUrl)
+        : buildThankYouEmailBody({ productName: salesData.upsell1Name, downloadUrl: salesData.upsell1DownloadUrl, fromName }),
     });
   }
 
-  if (salesData.upsell2Name) {
+  if (salesData.upsell2Name || salesData.upsell2ThankYouBody) {
     emailTemplates.push({
       name: 'Thank You - Upsell 2',
-      subject: `Thank you for adding ${salesData.upsell2Name}!`,
-      body: buildThankYouEmailBody({
-        productName: salesData.upsell2Name,
-        downloadUrl: salesData.upsell2DownloadUrl,
-        fromName,
-      }),
+      subject: salesData.upsell2ThankYouSubject || `Thank you for adding ${salesData.upsell2Name || 'your upsell'}!`,
+      body: salesData.upsell2ThankYouBody
+        ? wrapEmailBody(salesData.upsell2ThankYouBody, salesData.upsell2DownloadUrl)
+        : buildThankYouEmailBody({ productName: salesData.upsell2Name, downloadUrl: salesData.upsell2DownloadUrl, fromName }),
     });
   }
 
@@ -276,6 +323,12 @@ async function setupEmails(apiKey, locationId, salesData, clientData) {
   return created;
 }
 
+// Wrap a raw email body with the download URL link appended
+function wrapEmailBody(body, downloadUrl) {
+  if (!downloadUrl) return `<p>${body.replace(/\n/g, '</p><p>')}</p>`;
+  return `<p>${body.replace(/\n/g, '</p><p>')}</p>\n<p><a href="${downloadUrl}">Access your purchase here →</a></p>`;
+}
+
 function buildThankYouEmailBody({ productName, downloadUrl, fromName }) {
   return `
 <p>Hi {{contact.first_name}},</p>
@@ -290,7 +343,52 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-module.exports = { onboardClient };
+// ─────────────────────────────────────────────────────────────
+// COMPLETE SETUP — runs steps 4-6 using a sub-account token
+// Called when the agency key doesn't have sub-account scope
+// ─────────────────────────────────────────────────────────────
+async function completeSetup(locationToken, locationId, savedJob, log = console.log) {
+  const results = { steps: [], locationId };
+
+  try {
+    const salesData = savedJob.salesData || {};
+    const clientData = savedJob.clientData || {};
+
+    // ── STEP 4: Set custom values ──────────────────────────────
+    log('🔧 Step 4: Setting funnel custom values (with sub-account token)...');
+    const customValues = buildCustomValuesMap(clientData, salesData);
+    await ghl.setCustomValues(locationToken, locationId, customValues);
+    results.steps.push({ step: 4, label: 'Custom values set', status: 'ok', data: { count: Object.keys(customValues).length } });
+    log(`  ✓ Set ${Object.keys(customValues).length} custom values`);
+
+    // ── STEP 5: Create products ────────────────────────────────
+    log('🛍 Step 5: Creating products...');
+    const products = await setupProducts(locationToken, locationId, salesData);
+    results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
+    log(`  ✓ Created ${products.length} products`);
+
+    // ── STEP 6: Create thank you emails ────────────────────────
+    log('📧 Step 6: Creating post-purchase emails...');
+    const emails = await setupEmails(locationToken, locationId, salesData, clientData);
+    results.steps.push({ step: 6, label: 'Thank you emails created', status: 'ok', data: emails });
+    log(`  ✓ Created ${emails.length} email templates`);
+
+    results.status = 'complete';
+    results.message = '✅ Setup complete! Custom values, products, and emails are live.';
+    log(`\n${results.message}`);
+
+  } catch (err) {
+    results.status = 'error';
+    results.error = err.message;
+    results.errorDetail = err.response?.data || null;
+    log(`\n❌ Complete setup failed at step ${results.steps.length + 4}: ${err.message}`);
+    if (err.response?.data) log('API response:', JSON.stringify(err.response.data, null, 2));
+  }
+
+  return results;
+}
+
+module.exports = { onboardClient, completeSetup };
 
 // ─────────────────────────────────────────────────────────────
 // CLI MODE — run with: node onboard.js client.json

@@ -1,9 +1,10 @@
-// Web server — provides a UI form + GHL webhook receiver + status dashboard
+// Web server — GHL webhook receiver + Drive poller + admin UI
 require('dotenv').config();
 
 const express = require('express');
 const path = require('path');
-const { onboardClient } = require('./onboard');
+const { onboardClient, completeSetup } = require('./onboard');
+const { startPoller } = require('./poller');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,93 +13,151 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// In-memory job log (replace with DB for production)
-const jobs = new Map();
+// ── In-memory stores ───────────────────────────────────────────
+const jobs    = new Map(); // jobId → job
+const pending = new Map(); // clientKey → pending item
 
-// ── UI: Main form ─────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+// ── Drive poller ───────────────────────────────────────────────
+// Every 5 min, scans WATCH_FOLDER_ID for new client folders from ClientSpring AI
+startPoller(process.env.WATCH_FOLDER_ID, (clientKey, folderMap) => {
+  if (!pending.has(clientKey)) {
+    pending.set(clientKey, {
+      clientKey,
+      detectedAt:          folderMap.detectedAt,
+      offerFolderUrl:      folderMap.offer       || null,
+      backendFolderUrl:    folderMap.backend      || null,
+      silentSaleFolderUrl: folderMap.silentSale   || null,
+      status: 'pending',
+      source: 'poller',
+    });
+    console.log(`📥 Queued pending onboarding for: ${clientKey}`);
+  }
 });
 
-// ── API: Start onboarding from web form ───────────────────────
+// ── Admin UI ───────────────────────────────────────────────────
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
+// ── API: List pending ──────────────────────────────────────────
+app.get('/api/pending', (req, res) => {
+  res.json(Array.from(pending.values()));
+});
+
+// ── API: Approve + run a pending item ─────────────────────────
+app.post('/api/approve/:clientKey', async (req, res) => {
+  const item = pending.get(req.params.clientKey);
+  if (!item) return res.status(404).json({ error: 'Not found' });
+
+  const clientData = { ...item, ...req.body };
+  const jobId = `${req.params.clientKey}-${Date.now()}`;
+  const logs = [];
+
+  jobs.set(jobId, { status: 'running', logs, startedAt: new Date(), clientKey: req.params.clientKey });
+  item.status = 'running';
+
+  res.json({ jobId, statusUrl: `/api/status/${jobId}` });
+
+  const logger = (msg) => { console.log(msg); logs.push({ time: new Date().toISOString(), msg }); };
+  const result = await onboardClient(clientData, logger);
+  // Save clientData and salesData so /api/complete can re-run steps 4-6
+  jobs.set(jobId, { ...jobs.get(jobId), status: result.status, result, clientData, salesData: result.salesData, completedAt: new Date() });
+  item.status = result.status;
+  if (result.locationUrl) item.locationUrl = result.locationUrl;
+});
+
+// ── API: Manual onboard from web form ─────────────────────────
 app.post('/api/onboard', async (req, res) => {
   const jobId = Date.now().toString();
-  const clientData = req.body;
   const logs = [];
-
   jobs.set(jobId, { status: 'running', logs, startedAt: new Date() });
+  res.json({ jobId, statusUrl: `/api/status/${jobId}` });
 
-  // Kick off async — respond immediately with jobId
-  res.json({ jobId, message: 'Onboarding started', statusUrl: `/api/status/${jobId}` });
-
-  const logger = (msg) => {
-    console.log(msg);
-    logs.push({ time: new Date().toISOString(), msg });
-  };
-
-  const result = await onboardClient(clientData, logger);
-  jobs.set(jobId, { ...jobs.get(jobId), status: result.status, result, completedAt: new Date() });
+  const logger = (msg) => { console.log(msg); logs.push({ time: new Date().toISOString(), msg }); };
+  const result = await onboardClient(req.body, logger);
+  jobs.set(jobId, { ...jobs.get(jobId), status: result.status, result, clientData: req.body, salesData: result.salesData, completedAt: new Date() });
 });
 
-// ── WEBHOOK: Receive GHL form submission ──────────────────────
-// Point your GHL form's webhook to: POST /webhook/ghl-form
-app.post('/webhook/ghl-form', async (req, res) => {
-  const formData = req.body;
-  console.log('GHL Form webhook received:', JSON.stringify(formData, null, 2));
+// ── API: Complete setup with sub-account token ────────────────
+// Called from the dashboard when Steve pastes a sub-account PIT
+app.post('/api/complete/:jobId', async (req, res) => {
+  const { locationToken } = req.body;
+  if (!locationToken) return res.status(400).json({ error: 'locationToken required' });
 
-  // Map GHL form field names to our client data structure
-  // Adjust field names to match your actual GHL form fields
-  const clientData = {
-    businessName: formData['Business Name'] || formData.business_name || formData.businessName,
-    clientEmail: formData['Email'] || formData.email || formData.clientEmail,
-    clientPhone: formData['Phone'] || formData.phone || formData.clientPhone,
-    website: formData['Website'] || formData.website,
-    domain: formData['Domain'] || formData.domain,
-    timezone: formData['Timezone'] || formData.timezone || 'America/New_York',
-    salesCopyDocUrl: formData['Sales Copy Doc'] || formData.sales_copy_doc,
-    productName: formData['Product Name'] || formData.product_name,
-    productPrice: formData['Product Price'] || formData.product_price,
-    productDescription: formData['Product Description'] || formData.product_description,
-    downloadUrl: formData['Download URL'] || formData.download_url,
-    upsell1Name: formData['Upsell 1 Name'] || formData.upsell1_name,
-    upsell1Price: formData['Upsell 1 Price'] || formData.upsell1_price,
-    upsell1DownloadUrl: formData['Upsell 1 Download URL'] || formData.upsell1_download_url,
-    upsell2Name: formData['Upsell 2 Name'] || formData.upsell2_name,
-    upsell2Price: formData['Upsell 2 Price'] || formData.upsell2_price,
-    upsell2DownloadUrl: formData['Upsell 2 Download URL'] || formData.upsell2_download_url,
-    fromName: formData['From Name'] || formData.from_name,
-    fromEmail: formData['From Email'] || formData.from_email,
-    address: formData['Address'] || formData.address,
-    city: formData['City'] || formData.city,
-    state: formData['State'] || formData.state,
-    postalCode: formData['Postal Code'] || formData.postal_code,
-  };
+  // Find the original job to get locationId, salesData, clientData
+  const originalJob = jobs.get(req.params.jobId);
+  if (!originalJob) return res.status(404).json({ error: 'Job not found' });
 
-  const jobId = Date.now().toString();
+  const locationId = originalJob.result?.locationId;
+  if (!locationId) return res.status(400).json({ error: 'No locationId in original job' });
+
+  const completeJobId = `complete-${req.params.jobId}-${Date.now()}`;
   const logs = [];
-  jobs.set(jobId, { status: 'running', logs, startedAt: new Date(), source: 'webhook', rawData: formData });
+  jobs.set(completeJobId, { status: 'running', logs, startedAt: new Date(), parentJobId: req.params.jobId });
+  res.json({ jobId: completeJobId, statusUrl: `/api/status/${completeJobId}` });
 
-  res.json({ received: true, jobId });
+  const logger = (msg) => { console.log(msg); logs.push({ time: new Date().toISOString(), msg }); };
+  const result = await completeSetup(locationToken, locationId, {
+    salesData: originalJob.salesData || originalJob.result?.salesData || {},
+    clientData: originalJob.clientData || {},
+  }, logger);
 
-  const result = await onboardClient(clientData, (msg) => logs.push({ time: new Date().toISOString(), msg }));
-  jobs.set(jobId, { ...jobs.get(jobId), status: result.status, result, completedAt: new Date() });
+  jobs.set(completeJobId, { ...jobs.get(completeJobId), status: result.status, result, completedAt: new Date() });
+
+  // Update the original job status if complete succeeded
+  if (result.status === 'complete') {
+    originalJob.status = 'complete';
+    originalJob.result.needsLocationToken = false;
+    originalJob.result.steps = [...(originalJob.result.steps || []), ...result.steps];
+  }
 });
 
-// ── API: Check job status ─────────────────────────────────────
+// ── WEBHOOK: GHL form submission ───────────────────────────────
+// GHL fires this when a client submits Steve's intake form
+// Adds to pending queue — Steve reviews in /admin before running
+app.post('/webhook/ghl-form', (req, res) => {
+  const f = req.body;
+  console.log('GHL webhook received:', JSON.stringify(f, null, 2));
+
+  const firstName = f['First Name'] || f.first_name || '';
+  const lastName  = f['Last Name']  || f.last_name  || '';
+  const clientKey = f['Company Name'] || f.company_name || Date.now().toString();
+
+  pending.set(clientKey, {
+    clientKey,
+    businessName:        f['Company Name']    || f.company_name,
+    clientEmail:         f['Email']           || f.email,
+    clientPhone:         f['Phone']           || f.phone,
+    website:             f['Website']         || f.website,
+    address:             f['Company Address'] || f.company_address,
+    fromName:            `${firstName} ${lastName}`.trim(),
+    fromEmail:           f['Email']           || f.email,
+    offerFolderUrl:      f['Offer & Product Google Drive Link'] || f.offer_product_google_drive_link,
+    backendFolderUrl:    f['Backend Engine Google Drive Folder'] || f.backend_engine_google_drive_folder,
+    silentSaleFolderUrl: f['Silent Sale Machine Drive Folder']  || f.silent_sale_machine_drive_folder,
+    domain:              f['Domain Name'] || f.domain_name,
+    price:               f['Price']       || f.price,
+    vslLink:             f['VSL Link']    || f.vsl_link,
+    detectedAt:          new Date().toISOString(),
+    status:              'pending',
+    source:              'webhook',
+  });
+
+  res.json({ received: true, clientKey, reviewUrl: '/admin' });
+});
+
+// ── API: Job status ────────────────────────────────────────────
 app.get('/api/status/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
 });
 
-// ── API: List all jobs ────────────────────────────────────────
+// ── API: List jobs ─────────────────────────────────────────────
 app.get('/api/jobs', (req, res) => {
   const list = Array.from(jobs.entries()).map(([id, job]) => ({
-    id,
-    status: job.status,
-    startedAt: job.startedAt,
-    completedAt: job.completedAt,
-    businessName: job.result?.steps?.[0]?.data?.name || 'Unknown',
+    id, status: job.status, clientKey: job.clientKey,
+    startedAt: job.startedAt, completedAt: job.completedAt,
     locationUrl: job.result?.locationUrl,
   }));
   res.json(list.reverse());
@@ -106,5 +165,6 @@ app.get('/api/jobs', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\nGHL Onboarding Tool running at http://localhost:${PORT}`);
-  console.log(`Webhook URL: http://YOUR_DOMAIN:${PORT}/webhook/ghl-form\n`);
+  console.log(`Admin panel:  http://localhost:${PORT}/admin`);
+  console.log(`Webhook URL:  POST http://YOUR_DOMAIN:${PORT}/webhook/ghl-form\n`);
 });

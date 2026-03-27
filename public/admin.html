@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClientSpring Admin</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f7; color: #1d1d1f; }
+    header { background: #fff; border-bottom: 1px solid #e5e5e5; padding: 20px 40px; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    a.nav { color: #2563eb; text-decoration: none; font-size: 14px; }
+    main { max-width: 900px; margin: 32px auto; padding: 0 20px; }
+    h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
+    .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .meta { font-size: 13px; color: #666; margin: 4px 0 8px; }
+    .folders { font-family: monospace; font-size: 12px; color: #444; margin: 8px 0; line-height: 1.9; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 8px; vertical-align: middle; }
+    .badge-pending  { background: #fef3c7; color: #92400e; }
+    .badge-running  { background: #dbeafe; color: #1e40af; }
+    .badge-complete { background: #d1fae5; color: #065f46; }
+    .badge-error    { background: #fee2e2; color: #991b1b; }
+    .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
+    input[type=text], input[type=email] { width: 100%; border: 1px solid #d0d0d0; border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+    label { font-size: 12px; color: #666; display: block; margin-bottom: 3px; }
+    .run-btn { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 8px; }
+    .run-btn:hover { background: #1d4ed8; }
+    .run-btn:disabled { background: #93c5fd; cursor: not-allowed; }
+    .log { font-family: monospace; font-size: 12px; background: #f8f8f8; border-radius: 6px; padding: 12px; margin-top: 10px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; display: none; }
+    .empty { color: #999; font-size: 14px; padding: 20px 0; }
+    .ghl-link { margin-top: 8px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ClientSpring — Onboarding Admin</h1>
+    <a class="nav" href="/">Manual Form →</a>
+  </header>
+  <main>
+    <h2>Pending <span id="pending-count" style="color:#999;font-weight:400;font-size:13px;"></span></h2>
+    <div id="pending-list"><p class="empty">Loading...</p></div>
+
+    <h2 style="margin-top:32px;">Recent Jobs</h2>
+    <div id="jobs-list"><p class="empty">Loading...</p></div>
+  </main>
+
+  <script>
+    // Safe text helper — never use innerHTML with external data
+    function el(tag, attrs, ...children) {
+      const node = document.createElement(tag);
+      for (const [k, v] of Object.entries(attrs || {})) {
+        if (k === 'class') node.className = v;
+        else if (k === 'style') node.style.cssText = v;
+        else node.setAttribute(k, v);
+      }
+      for (const child of children) {
+        if (typeof child === 'string') node.appendChild(document.createTextNode(child));
+        else if (child) node.appendChild(child);
+      }
+      return node;
+    }
+
+    function badge(status) {
+      return el('span', { class: 'badge badge-' + status }, status);
+    }
+
+    function folderLine(label, url) {
+      if (!url) return null;
+      const div = el('div', {});
+      div.appendChild(document.createTextNode('📁 ' + label + ': '));
+      const a = el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' });
+      a.textContent = url.length > 60 ? url.slice(0, 60) + '...' : url;
+      div.appendChild(a);
+      return div;
+    }
+
+    function buildPendingCard(p) {
+      const card = el('div', { class: 'card' });
+
+      // Title row
+      const title = el('div', {});
+      title.appendChild(el('strong', {}, p.clientKey || '(unknown)'));
+      title.appendChild(badge(p.status));
+      card.appendChild(title);
+
+      // Meta
+      const detectedAt = p.detectedAt ? new Date(p.detectedAt).toLocaleString() : '—';
+      card.appendChild(el('div', { class: 'meta' }, 'Detected: ' + detectedAt + ' · Source: ' + (p.source || 'poller')));
+
+      // Folder links
+      const folders = el('div', { class: 'folders' });
+      [folderLine('Offer', p.offerFolderUrl), folderLine('Backend', p.backendFolderUrl), folderLine('Silent Sale', p.silentSaleFolderUrl)]
+        .filter(Boolean).forEach(f => folders.appendChild(f));
+      card.appendChild(folders);
+
+      if (p.status !== 'pending') return card;
+
+      // Approval form
+      const form = document.createElement('form');
+      form.addEventListener('submit', (e) => approve(e, p, form));
+
+      const fields = el('div', { class: 'fields' });
+
+      const nameField = el('div', {});
+      nameField.appendChild(el('label', {}, 'Business Name'));
+      const nameInput = el('input', { type: 'text', name: 'businessName', required: 'required' });
+      nameInput.value = p.businessName || p.clientKey || '';
+      nameField.appendChild(nameInput);
+      fields.appendChild(nameField);
+
+      const emailField = el('div', {});
+      emailField.appendChild(el('label', {}, 'Client Email'));
+      const emailInput = el('input', { type: 'email', name: 'clientEmail', required: 'required' });
+      emailInput.value = p.clientEmail || '';
+      emailField.appendChild(emailInput);
+      fields.appendChild(emailField);
+
+      const domainField = el('div', {});
+      domainField.appendChild(el('label', {}, 'Domain Name'));
+      const domainInput = el('input', { type: 'text', name: 'domain' });
+      domainInput.value = p.domain || '';
+      domainField.appendChild(domainInput);
+      fields.appendChild(domainField);
+
+      const priceField = el('div', {});
+      priceField.appendChild(el('label', {}, 'Price Override'));
+      const priceInput = el('input', { type: 'text', name: 'price' });
+      priceInput.value = p.price || '';
+      priceField.appendChild(priceInput);
+      fields.appendChild(priceField);
+
+      form.appendChild(fields);
+
+      const btn = el('button', { type: 'submit', class: 'run-btn' }, '▶ Run Onboarding');
+      form.appendChild(btn);
+      card.appendChild(form);
+
+      const logDiv = el('div', { class: 'log', id: 'log-' + p.clientKey });
+      card.appendChild(logDiv);
+
+      return card;
+    }
+
+    function buildJobCard(j) {
+      const card = el('div', { class: 'card' });
+      const title = el('div', {});
+      title.appendChild(el('strong', {}, j.clientKey || j.id));
+      title.appendChild(badge(j.status));
+      card.appendChild(title);
+      if (j.startedAt) card.appendChild(el('div', { class: 'meta' }, new Date(j.startedAt).toLocaleString()));
+      if (j.locationUrl) {
+        const linkDiv = el('div', { class: 'ghl-link' });
+        const a = el('a', { href: j.locationUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Open in GHL →');
+        linkDiv.appendChild(a);
+        card.appendChild(linkDiv);
+      }
+      return card;
+    }
+
+    async function load() {
+      const [pending, jobs] = await Promise.all([
+        fetch('/api/pending').then(r => r.json()),
+        fetch('/api/jobs').then(r => r.json()),
+      ]);
+
+      document.getElementById('pending-count').textContent = '(' + pending.length + ')';
+
+      const pl = document.getElementById('pending-list');
+      pl.replaceChildren();
+      if (pending.length === 0) {
+        pl.appendChild(el('p', { class: 'empty' }, 'No pending clients — poller is watching for new Drive folders.'));
+      } else {
+        pending.forEach(p => pl.appendChild(buildPendingCard(p)));
+      }
+
+      const jl = document.getElementById('jobs-list');
+      jl.replaceChildren();
+      if (jobs.length === 0) {
+        jl.appendChild(el('p', { class: 'empty' }, 'No jobs yet.'));
+      } else {
+        jobs.slice(0, 10).forEach(j => jl.appendChild(buildJobCard(j)));
+      }
+    }
+
+    async function approve(e, p, form) {
+      e.preventDefault();
+      const extra = Object.fromEntries(new FormData(form));
+      const btn = form.querySelector('.run-btn');
+      btn.textContent = 'Running...';
+      btn.disabled = true;
+
+      const res = await fetch('/api/approve/' + encodeURIComponent(p.clientKey), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(extra),
+      });
+      const { jobId } = await res.json();
+      pollJob(jobId, p.clientKey);
+    }
+
+    function pollJob(jobId, clientKey) {
+      const logDiv = document.getElementById('log-' + clientKey);
+      if (logDiv) logDiv.style.display = 'block';
+
+      async function check() {
+        const job = await fetch('/api/status/' + jobId).then(r => r.json());
+        if (logDiv) logDiv.textContent = job.logs.map(l => l.msg).join('\n');
+        if (job.status === 'running') {
+          setTimeout(check, 1500);
+        } else {
+          load();
+        }
+      }
+      check();
+    }
+
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>
