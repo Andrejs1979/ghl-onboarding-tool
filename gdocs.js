@@ -157,11 +157,41 @@ function parseSalesPageDoc(paragraphs) {
     if (match) data.mainProductName = match[1].trim();
   }
 
-  // Extract price
+  // Fallback product name extraction: look for "The X" pattern in headings,
+  // or use the first HEADING_2/HEADING_3 that looks like a product title
+  if (!data.mainProductName) {
+    // Try: lines containing "The [Something] Method/System/Guide/Course/Toolkit/Roadmap/Checklist/Blueprint/Program"
+    const allLines = paragraphs.map(p => p.text);
+    for (const line of allLines) {
+      const prodMatch = line.match(/\b(The\s+[\w\s]+(?:Method|System|Guide|Course|Toolkit|Roadmap|Checklist|Blueprint|Program|Audit|Framework|Playbook|Masterclass|Workshop|Academy))\b/i);
+      if (prodMatch) {
+        data.mainProductName = prodMatch[1].trim();
+        break;
+      }
+    }
+  }
+  // Further fallback: first heading that isn't a section label
+  if (!data.mainProductName) {
+    const sectionLabels = /^(header|headline|price|offer|solution|product|section|body|footer|cta|call to action|benefits|features|guarantee|testimonial|faq|bonus)/i;
+    for (const para of paragraphs) {
+      if (para.style.startsWith('HEADING') && !sectionLabels.test(para.text.trim()) && para.text.trim().length > 3 && para.text.trim().length < 80) {
+        data.mainProductName = para.text.trim();
+        break;
+      }
+    }
+  }
+
+  // Extract price — search all paragraphs if no price section exists
   const priceLines = sections['price'] || [];
   for (const line of priceLines) {
     const match = line.match(/\$\s*(\d+(?:\.\d{2})?)/);
     if (match) { data.mainProductPrice = match[1]; break; }
+  }
+  if (!data.mainProductPrice) {
+    for (const para of paragraphs) {
+      const match = para.text.match(/\$\s*(\d+(?:\.\d{2})?)/);
+      if (match) { data.mainProductPrice = match[1]; break; }
+    }
   }
 
   // Extract description from solution section
@@ -177,8 +207,20 @@ function parseSalesPageDoc(paragraphs) {
 // Returns: { name, headline, price, description }
 function parseUpsellSalesPageDoc(paragraphs) {
   const base = parseSalesPageDoc(paragraphs);
+  let name = base.mainProductName || '';
+
+  // If parseSalesPageDoc didn't find a name, try the first heading in the doc
+  if (!name) {
+    for (const para of paragraphs) {
+      if (para.style.startsWith('HEADING') && para.text.trim().length > 3 && para.text.trim().length < 80) {
+        name = para.text.trim();
+        break;
+      }
+    }
+  }
+
   return {
-    name: base.mainProductName || '',
+    name,
     headline: base.salesHeadline || '',
     price: base.mainProductPrice || '',
     description: base.mainProductDescription || '',
@@ -191,26 +233,55 @@ function parseThankYouEmailDoc(paragraphs) {
   let subject = '';
   let bodyLines = [];
   let inBody = false;
+  const subjectOptions = [];
 
   for (const line of lines) {
-    const upper = line.toUpperCase();
+    const upper = line.toUpperCase().trim();
+
+    // Skip separator lines
+    if (/^[─━\-=]{5,}$/.test(line.trim())) continue;
+    // Skip section headers — but set inBody flag when we pass EMAIL BODY
+    if (upper === 'EMAIL BODY' || upper === 'BODY') { inBody = true; continue; }
+    if (upper === 'SUBJECT LINES' || upper === 'SUBJECT LINE' || upper === 'PREVIEW TEXT') continue;
+    if (upper.match(/^SUBJECT LINES?\s*\(.*\)$/)) continue;
+
     if (upper.startsWith('SUBJECT:') || upper.startsWith('EMAIL SUBJECT:')) {
       subject = line.replace(/^.*?:\s*/i, '').trim();
-    } else if (upper.includes('BODY') || upper.includes('EMAIL BODY') || inBody) {
-      inBody = true;
-      if (!upper.includes('BODY')) bodyLines.push(line);
+    } else if (upper.startsWith('OPTION') && upper.includes(':') && !inBody) {
+      subjectOptions.push(line.replace(/^Option\s*\d+:\s*/i, '').trim());
+    } else if (inBody) {
+      bodyLines.push(line);
     }
   }
 
-  // Fallback: first non-empty line is subject, rest is body
-  if (!subject && lines.length > 0) {
-    subject = lines[0];
-    bodyLines = lines.slice(1);
+  // Use first subject option if no explicit "SUBJECT:" was found
+  if (!subject && subjectOptions.length > 0) {
+    subject = subjectOptions[0];
   }
+
+  // Fallback: first non-empty, non-separator line is subject, rest is body
+  if (!subject && lines.length > 0) {
+    const contentLines = lines.filter(l => !/^[─━─\-=]{5,}$/.test(l.trim()) && l.trim());
+    subject = contentLines[0] || lines[0];
+    bodyLines = contentLines.slice(1);
+  }
+
+  // Clean up body: strip separators, replace [DOWNLOAD LINK] / [BOOKING LINK] placeholders
+  const cleanedBody = bodyLines
+    .filter(l => !/^[─━─\-=]{5,}$/.test(l.trim()))
+    .filter(l => {
+      const u = l.trim().toUpperCase();
+      return u !== 'SUBJECT LINES' && u !== 'PREVIEW TEXT' && u !== 'EMAIL BODY' && !u.match(/^SUBJECT LINES?\s*\(.*\)$/);
+    })
+    .join('\n')
+    .replace(/\[DOWNLOAD[^\]]*(?:LINK|HERE)\]/gi, '{{download_link}}')
+    .replace(/\[BOOK[^\]]*(?:LINK|HERE|CALL|SESSION)\]/gi, '{{booking_link}}')
+    .replace(/\[CALENDLY\s+LINK\]/gi, '{{booking_link}}')
+    .trim();
 
   return {
     subject,
-    body: bodyLines.join('\n').trim(),
+    body: cleanedBody,
   };
 }
 
@@ -241,8 +312,15 @@ async function parseOfferFolder(folderUrl) {
       const parsed = parseThankYouEmailDoc(paragraphs);
       data.thankYouEmailSubject = parsed.subject;
       data.thankYouEmailBody = parsed.body;
-      // Brief: "Puts the URL link to the Google Doc in the download URL link in the emails"
-      data.downloadUrl = `https://docs.google.com/document/d/${file.id}/edit`;
+      // Extract actual download URL from doc content (external links, Drive files)
+      const docText = paragraphs.map(p => p.text).join('\n');
+      const externalUrl = docText.match(/https?:\/\/(?!docs\.google\.com\/document)[^\s\])<]+/);
+      if (externalUrl) {
+        data.downloadUrl = externalUrl[0];
+      } else {
+        // Fallback: use the doc itself (Steve's original intent — link to the Google Doc as the deliverable)
+        data.downloadUrl = `https://docs.google.com/document/d/${file.id}/edit`;
+      }
     }
   }
 
@@ -277,12 +355,28 @@ async function parseBackendFolder(folderUrl) {
 
     if (role === 'upsell1Product') {
       const text = paragraphs.map(p => p.text).join('\n');
-      // Extract product name and URL from product doc (only if not already set from thank-you doc)
+      // Extract product name and URL from product doc (only if not already set)
       const urlMatch = text.match(/https?:\/\/[^\s]+/);
       if (urlMatch && !data.upsell1DownloadUrl) data.upsell1DownloadUrl = urlMatch[0];
       if (!data.upsell1Name) {
-        const nameMatch = text.match(/(?:product|offer|name)[:\s]+(.+)/i);
-        if (nameMatch) data.upsell1Name = nameMatch[1].trim();
+        // Try explicit label format first: "Product Name: X" or "Offer: X"
+        const labelMatch = text.match(/(?:product\s*name|offer\s*name|name)\s*[:]\s*(.+)/i);
+        if (labelMatch) {
+          data.upsell1Name = labelMatch[1].trim();
+        } else {
+          // Try "The X Method/Toolkit/etc" pattern
+          const prodMatch = text.match(/\b(The\s+[\w\s]+(?:Method|System|Guide|Course|Toolkit|Roadmap|Checklist|Blueprint|Program|Audit|Framework|Playbook))\b/i);
+          if (prodMatch) data.upsell1Name = prodMatch[1].trim();
+          // Last resort: first heading
+          else {
+            for (const para of paragraphs) {
+              if (para.style.startsWith('HEADING') && para.text.trim().length > 3) {
+                data.upsell1Name = para.text.trim();
+                break;
+              }
+            }
+          }
+        }
       }
     }
 

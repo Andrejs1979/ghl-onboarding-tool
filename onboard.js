@@ -96,35 +96,56 @@ async function onboardClient(clientData, log = console.log) {
     // Save salesData in results for the /api/complete flow
     results.salesData = salesData;
 
-    // ── STEPS 4-6: Try with agency key first, fall back to "needs token" ──
+    // ── STEPS 4-6: Try each independently with agency key ──────
+    const customValues = buildCustomValuesMap(clientData, salesData);
+    results.customValues = customValues; // Always include for manual fallback
+
+    // ── STEP 4: Set custom values (funnel variables) ──────────
     try {
-      // ── STEP 4: Set custom values (funnel variables) ──────────
       log('🔧 Step 4: Setting funnel custom values...');
-      const customValues = buildCustomValuesMap(clientData, salesData);
       await ghl.setCustomValues(API_KEY, location.id, customValues);
       results.steps.push({ step: 4, label: 'Custom values set', status: 'ok', data: { count: Object.keys(customValues).length } });
       log(`  ✓ Set ${Object.keys(customValues).length} custom values`);
+    } catch (cvErr) {
+      results.steps.push({ step: 4, label: 'Custom values — needs manual setup or sub-account token', status: 'pending', error: cvErr.message });
+      results.manualStepsNeeded = true;
+      log(`  ⚠ Custom values failed (${cvErr.message}) — included in result for manual setup`);
+    }
 
-      // ── STEP 5: Create products ───────────────────────────────
+    // ── STEP 5: Create products ───────────────────────────────
+    try {
       log('🛍 Step 5: Creating products...');
       const products = await setupProducts(API_KEY, location.id, salesData);
-      results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
-      log(`  ✓ Created ${products.length} products`);
+      if (products.length === 0) {
+        results.steps.push({ step: 5, label: 'No products created — check salesData parsing', status: 'warning', data: products });
+        log(`  ⚠ No products created (mainProductName: ${salesData.mainProductName || 'MISSING'}, mainProductPrice: ${salesData.mainProductPrice || 'MISSING'})`);
+      } else {
+        results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
+        log(`  ✓ Created ${products.length} products`);
+      }
+    } catch (prodErr) {
+      results.steps.push({ step: 5, label: 'Products — needs manual setup or sub-account token', status: 'pending', error: prodErr.message });
+      results.manualStepsNeeded = true;
+      log(`  ⚠ Products failed (${prodErr.message})`);
+    }
 
-      // ── STEP 6: Create thank you emails ───────────────────────
+    // ── STEP 6: Create thank you emails ───────────────────────
+    try {
       log('📧 Step 6: Creating post-purchase emails...');
       const emails = await setupEmails(API_KEY, location.id, salesData, clientData);
       results.steps.push({ step: 6, label: 'Thank you emails created', status: 'ok', data: emails });
       log(`  ✓ Created ${emails.length} email templates`);
-    } catch (scopeErr) {
-      // Agency key may not have sub-account level scopes — mark for completion with sub-account token
-      log(`  ⚠ Steps 4-6 need sub-account token: ${scopeErr.message}`);
-      results.steps.push({ step: 4, label: 'Custom values — pending sub-account token', status: 'pending' });
-      results.steps.push({ step: 5, label: 'Products — pending sub-account token', status: 'pending' });
-      results.steps.push({ step: 6, label: 'Emails — pending sub-account token', status: 'pending' });
-      results.needsLocationToken = true;
+    } catch (emailErr) {
+      // Save email templates in result so they can be imported manually
+      const emailTemplates = buildEmailTemplates(salesData, clientData);
+      results.steps.push({ step: 6, label: 'Emails — needs manual setup or sub-account token', status: 'pending', error: emailErr.message });
+      results.emailTemplates = emailTemplates;
       results.manualStepsNeeded = true;
+      log(`  ⚠ Emails failed (${emailErr.message}) — templates saved in result for manual import`);
     }
+
+    // Check if any steps need a token
+    results.needsLocationToken = results.steps.some(s => s.status === 'pending');
 
     // ── STEP 7: Set domain (if provided) ─────────────────────
     if (clientData.domain) {
@@ -141,10 +162,18 @@ async function onboardClient(clientData, log = console.log) {
       }
     }
 
-    results.status = results.needsLocationToken ? 'complete_partial' : 'complete';
-    results.message = results.needsLocationToken
-      ? `⚠ Partial — sub-account created, paste token to complete setup. Location: ${results.locationUrl}`
-      : `✅ Onboarding complete! Location: ${results.locationUrl}`;
+    // Check if any steps had warnings (e.g., zero products)
+    const hasWarnings = results.steps.some(s => s.status === 'warning');
+    if (results.needsLocationToken) {
+      results.status = 'complete_partial';
+      results.message = `⚠ Partial — sub-account created, paste token to complete setup. Location: ${results.locationUrl}`;
+    } else if (hasWarnings) {
+      results.status = 'complete';
+      results.message = `⚠ Complete with warnings — review step results. Location: ${results.locationUrl}`;
+    } else {
+      results.status = 'complete';
+      results.message = `✅ Onboarding complete! Location: ${results.locationUrl}`;
+    }
     log(`\n${results.message}`);
 
   } catch (err) {
@@ -329,6 +358,49 @@ function wrapEmailBody(body, downloadUrl) {
   return `<p>${body.replace(/\n/g, '</p><p>')}</p>\n<p><a href="${downloadUrl}">Access your purchase here →</a></p>`;
 }
 
+// Build email template data for manual import when API fails
+function buildEmailTemplates(salesData, clientData) {
+  const fromName = salesData.fromName || clientData.businessName || 'CS Ltd';
+  const fromEmail = salesData.fromEmail || clientData.fromEmail || clientData.clientEmail;
+  const templates = [];
+
+  templates.push({
+    name: 'Thank You - Main Product',
+    subject: salesData.thankYouEmailSubject || `Thank you for your purchase of ${salesData.mainProductName || 'our product'}!`,
+    body: salesData.thankYouEmailBody
+      ? wrapEmailBody(salesData.thankYouEmailBody, salesData.downloadUrl)
+      : buildThankYouEmailBody({ productName: salesData.mainProductName, downloadUrl: salesData.downloadUrl, fromName }),
+    fromName,
+    fromEmail,
+  });
+
+  if (salesData.upsell1Name || salesData.upsell1ThankYouBody) {
+    templates.push({
+      name: 'Thank You - Upsell 1',
+      subject: salesData.upsell1ThankYouSubject || `Thank you for adding ${salesData.upsell1Name || 'your upsell'}!`,
+      body: salesData.upsell1ThankYouBody
+        ? wrapEmailBody(salesData.upsell1ThankYouBody, salesData.upsell1DownloadUrl)
+        : buildThankYouEmailBody({ productName: salesData.upsell1Name, downloadUrl: salesData.upsell1DownloadUrl, fromName }),
+      fromName,
+      fromEmail,
+    });
+  }
+
+  if (salesData.upsell2Name || salesData.upsell2ThankYouBody) {
+    templates.push({
+      name: 'Thank You - Upsell 2',
+      subject: salesData.upsell2ThankYouSubject || `Thank you for adding ${salesData.upsell2Name || 'your upsell'}!`,
+      body: salesData.upsell2ThankYouBody
+        ? wrapEmailBody(salesData.upsell2ThankYouBody, salesData.upsell2DownloadUrl)
+        : buildThankYouEmailBody({ productName: salesData.upsell2Name, downloadUrl: salesData.upsell2DownloadUrl, fromName }),
+      fromName,
+      fromEmail,
+    });
+  }
+
+  return templates;
+}
+
 function buildThankYouEmailBody({ productName, downloadUrl, fromName }) {
   return `
 <p>Hi {{contact.first_name}},</p>
@@ -364,8 +436,13 @@ async function completeSetup(locationToken, locationId, savedJob, log = console.
     // ── STEP 5: Create products ────────────────────────────────
     log('🛍 Step 5: Creating products...');
     const products = await setupProducts(locationToken, locationId, salesData);
-    results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
-    log(`  ✓ Created ${products.length} products`);
+    if (products.length === 0) {
+      results.steps.push({ step: 5, label: 'No products created — check salesData parsing', status: 'warning', data: products });
+      log(`  ⚠ No products created (mainProductName: ${salesData.mainProductName || 'MISSING'}, mainProductPrice: ${salesData.mainProductPrice || 'MISSING'})`);
+    } else {
+      results.steps.push({ step: 5, label: 'Products created', status: 'ok', data: products });
+      log(`  ✓ Created ${products.length} products`);
+    }
 
     // ── STEP 6: Create thank you emails ────────────────────────
     log('📧 Step 6: Creating post-purchase emails...');

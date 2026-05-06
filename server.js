@@ -68,14 +68,36 @@ app.post('/api/approve/:clientKey', async (req, res) => {
 
 // ── API: Manual onboard from web form ─────────────────────────
 app.post('/api/onboard', async (req, res) => {
+  // Map form field names ("Company Name") to code field names ("businessName") if needed
+  const body = req.body;
+  const clientData = {
+    businessName:   body.businessName   || body['Company Name']    || body.company_name,
+    clientEmail:    body.clientEmail    || body['Email']           || body.email,
+    clientPhone:    body.clientPhone    || body['Phone']           || body.phone,
+    website:        body.website        || body['Website'],
+    address:        body.address        || body['Company Address'] || body.company_address,
+    domain:         body.domain         || body['Domain Name']     || body.domain_name,
+    fromName:       body.fromName       || [body['First Name'], body['Last Name']].filter(Boolean).join(' ') || '',
+    fromEmail:      body.fromEmail      || body['Email']           || body.email,
+    offerFolderUrl: body.offerFolderUrl || body['Offer & Product Google Drive Link'],
+    backendFolderUrl: body.backendFolderUrl || body['Backend Engine Google Drive Folder'],
+    silentSaleFolderUrl: body.silentSaleFolderUrl || body['Silent Sale Machine Drive Folder'],
+    price:          body.price          || body['Price'],
+    vslLink:        body.vslLink        || body['VSL Link'],
+    productName:    body.productName,
+    productPrice:   body.productPrice,
+    timezone:       body.timezone       || 'America/New_York',
+  };
+
+  const clientKey = clientData.businessName || null;
   const jobId = Date.now().toString();
   const logs = [];
-  jobs.set(jobId, { status: 'running', logs, startedAt: new Date() });
+  jobs.set(jobId, { status: 'running', logs, startedAt: new Date(), clientKey });
   res.json({ jobId, statusUrl: `/api/status/${jobId}` });
 
   const logger = (msg) => { console.log(msg); logs.push({ time: new Date().toISOString(), msg }); };
-  const result = await onboardClient(req.body, logger);
-  jobs.set(jobId, { ...jobs.get(jobId), status: result.status, result, clientData: req.body, salesData: result.salesData, completedAt: new Date() });
+  const result = await onboardClient(clientData, logger);
+  jobs.set(jobId, { ...jobs.get(jobId), status: result.status, result, clientData, salesData: result.salesData, completedAt: new Date() });
 });
 
 // ── API: Complete setup with sub-account token ────────────────
@@ -159,6 +181,8 @@ app.get('/api/jobs', (req, res) => {
     id, status: job.status, clientKey: job.clientKey,
     startedAt: job.startedAt, completedAt: job.completedAt,
     locationUrl: job.result?.locationUrl,
+    needsLocationToken: job.result?.needsLocationToken,
+    manualStepsNeeded: job.result?.manualStepsNeeded,
   }));
   res.json(list.reverse());
 });

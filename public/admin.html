@@ -34,9 +34,39 @@
 <body>
   <header>
     <h1>ClientSpring — Onboarding Admin</h1>
-    <a class="nav" href="/">Manual Form →</a>
+    <div style="display:flex;gap:12px;align-items:center;">
+      <a class="nav" href="#" id="manual-onboard-btn" style="background:#2563eb;color:#fff;padding:6px 14px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;">+ Manual Onboard</a>
+      <a class="nav" href="/">Form Page →</a>
+    </div>
   </header>
   <main>
+    <!-- Manual Onboard Modal -->
+    <div id="manual-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:100;display:none;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:28px;max-width:560px;width:90%;max-height:90vh;overflow-y:auto;box-shadow:0 8px 30px rgba(0,0,0,0.2);">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+          <h2 style="font-size:16px;margin:0;">Manual Onboard</h2>
+          <button id="modal-close" style="background:none;border:none;font-size:20px;cursor:pointer;color:#666;">&times;</button>
+        </div>
+        <form id="manual-form">
+          <div class="fields" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">
+            <div><label>Business Name *</label><input type="text" name="businessName" required placeholder="Acme Corp"></div>
+            <div><label>Client Email *</label><input type="email" name="clientEmail" required placeholder="john@example.com"></div>
+            <div><label>Client Phone</label><input type="text" name="clientPhone" placeholder="+1 555-123-4567"></div>
+            <div><label>Website</label><input type="url" name="website" placeholder="https://example.com"></div>
+            <div><label>From Name</label><input type="text" name="fromName" placeholder="John Smith"></div>
+            <div><label>From Email</label><input type="email" name="fromEmail" placeholder="john@example.com"></div>
+            <div style="grid-column:1/-1;"><label>Offer & Product Drive Folder</label><input type="url" name="offerFolderUrl" placeholder="https://drive.google.com/drive/folders/..."></div>
+            <div style="grid-column:1/-1;"><label>Backend Engine Drive Folder</label><input type="url" name="backendFolderUrl" placeholder="https://drive.google.com/drive/folders/..."></div>
+            <div><label>Domain Name</label><input type="text" name="domain" placeholder="client.clientspring.ai"></div>
+            <div><label>Price Override</label><input type="number" name="price" placeholder="27"></div>
+            <div style="grid-column:1/-1;"><label>VSL Link</label><input type="url" name="vslLink" placeholder="https://loom.com/..."></div>
+          </div>
+          <button type="submit" class="run-btn" style="width:100%;">▶ Start Onboarding</button>
+        </form>
+        <div id="manual-log" class="log" style="display:none;margin-top:12px;"></div>
+      </div>
+    </div>
+
     <h2>Pending <span id="pending-count" style="color:#999;font-weight:400;font-size:13px;"></span></h2>
     <div id="pending-list"><p class="empty">Loading...</p></div>
 
@@ -154,6 +184,82 @@
         linkDiv.appendChild(a);
         card.appendChild(linkDiv);
       }
+
+      // Completion UI for partial jobs
+      if (j.status === 'complete_partial' && j.id) {
+        const completeSection = el('div', { style: 'margin-top:12px;border-top:1px solid #e5e5e5;padding-top:12px;' });
+
+        // Option 1: Paste a sub-account PIT to complete automatically
+        completeSection.appendChild(el('div', { style: 'font-size:12px;font-weight:600;color:#2563eb;margin-bottom:6px;' }, '🔑 Complete Setup'));
+        completeSection.appendChild(el('div', { style: 'font-size:11px;color:#666;margin-bottom:8px;' },
+          'Paste a sub-account Private Integration Token (PIT) to auto-complete steps 4-6:'));
+
+        const pitRow = el('div', { style: 'display:flex;gap:8px;margin-bottom:10px;' });
+        const pitInput = el('input', { type: 'text', placeholder: 'pit-xxxxxxxx...', style: 'flex:1;font-size:12px;' });
+        const pitBtn = el('button', { class: 'run-btn', style: 'padding:6px 12px;font-size:12px;margin-top:0;' }, '▶ Complete');
+        pitRow.appendChild(pitInput);
+        pitRow.appendChild(pitBtn);
+        completeSection.appendChild(pitRow);
+
+        const pitLog = el('div', { class: 'log', style: 'display:none;' });
+        completeSection.appendChild(pitLog);
+
+        pitBtn.addEventListener('click', async () => {
+          const token = pitInput.value.trim();
+          if (!token) return;
+          pitBtn.textContent = 'Running...';
+          pitBtn.disabled = true;
+          pitLog.style.display = 'block';
+
+          try {
+            const res = await fetch('/api/complete/' + encodeURIComponent(j.id), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ locationToken: token }),
+            });
+            const { jobId } = await res.json();
+
+            async function pollComplete() {
+              const sr = await fetch('/api/status/' + encodeURIComponent(jobId)).then(r => r.json());
+              pitLog.textContent = sr.logs.map(l => l.msg).join('\n');
+              if (sr.status === 'running') {
+                setTimeout(pollComplete, 1500);
+              } else {
+                pitBtn.textContent = '▶ Complete';
+                pitBtn.disabled = false;
+                load();
+              }
+            }
+            pollComplete();
+          } catch (err) {
+            pitLog.textContent = 'Error: ' + err.message;
+            pitBtn.textContent = '▶ Complete';
+            pitBtn.disabled = false;
+          }
+        });
+
+        // Option 2: Copy custom values for manual setup
+        completeSection.appendChild(el('div', { style: 'font-size:11px;color:#666;margin-top:8px;margin-bottom:4px;' },
+          'Or copy values for manual setup in GHL:'));
+
+        const copyBtn = el('button', { class: 'run-btn', style: 'padding:4px 10px;font-size:11px;margin-top:0;background:#6b7280;' }, '📋 Copy Custom Values');
+        copyBtn.addEventListener('click', async () => {
+          try {
+            const statusRes = await fetch('/api/status/' + encodeURIComponent(j.id)).then(r => r.json());
+            const cv = statusRes.result?.customValues || statusRes.clientData || {};
+            const text = Object.entries(cv).filter(([,v]) => v).map(([k,v]) => k + ': ' + v).join('\n');
+            await navigator.clipboard.writeText(text);
+            copyBtn.textContent = '✅ Copied!';
+            setTimeout(() => { copyBtn.textContent = '📋 Copy Custom Values'; }, 2000);
+          } catch (err) {
+            copyBtn.textContent = 'Copy failed';
+          }
+        });
+        completeSection.appendChild(copyBtn);
+
+        card.appendChild(completeSection);
+      }
+
       return card;
     }
 
@@ -213,6 +319,58 @@
       }
       check();
     }
+
+    // Manual Onboard Modal
+    const modal = document.getElementById('manual-modal');
+    document.getElementById('manual-onboard-btn').addEventListener('click', (e) => {
+      e.preventDefault();
+      modal.style.display = 'flex';
+    });
+    document.getElementById('modal-close').addEventListener('click', () => {
+      modal.style.display = 'none';
+    });
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) modal.style.display = 'none';
+    });
+
+    document.getElementById('manual-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const data = Object.fromEntries(new FormData(form));
+      const btn = form.querySelector('.run-btn');
+      const logDiv = document.getElementById('manual-log');
+      btn.textContent = 'Running...';
+      btn.disabled = true;
+      logDiv.style.display = 'block';
+      logDiv.textContent = '';
+
+      try {
+        const res = await fetch('/api/onboard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        const { jobId } = await res.json();
+
+        async function pollManual() {
+          const sr = await fetch('/api/status/' + jobId).then(r => r.json());
+          logDiv.textContent = sr.logs.map(l => l.msg).join('\n');
+          logDiv.scrollTop = logDiv.scrollHeight;
+          if (sr.status === 'running') {
+            setTimeout(pollManual, 1500);
+          } else {
+            btn.disabled = false;
+            btn.textContent = '▶ Start Onboarding';
+            load();
+          }
+        }
+        pollManual();
+      } catch (err) {
+        logDiv.textContent = 'Error: ' + err.message;
+        btn.disabled = false;
+        btn.textContent = '▶ Start Onboarding';
+      }
+    });
 
     load();
     setInterval(load, 30000);

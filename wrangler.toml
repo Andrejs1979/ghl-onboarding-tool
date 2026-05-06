@@ -1,0 +1,26 @@
+# ClientSpring GHL Onboarding Tool — Cloudflare Worker
+name = "steve-ghl-onboarding"
+main = "src/worker.js"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Deployed under the clients namespace: clients.finhub.workers.dev/steve-ghl/
+# Route prefix is handled by the parent "clients" worker which proxies to this one
+
+[vars]
+GHL_COMPANY_ID = "qABsQ3kyRK44RV0L2R5N"
+MASTER_SNAPSHOT_ID = "MRe8Er9cmQzY0jAy8Oiq"
+CLIENT_ID = "steve-ghl"
+
+# Secrets (set via `wrangler secret put`):
+# GHL_API_KEY        — Agency Private Integration Token
+# GHL_CLIENT_ID      — OAuth app client ID
+# GHL_CLIENT_SECRET  — OAuth app client secret
+# GOOGLE_SA_KEY      — Google Service Account JSON (base64 encoded)
+
+[[kv_namespaces]]
+binding = "KV"
+id = ""  # Set after `wrangler kv namespace create KV`
+
+[build]
+command = "npm run build:worker"

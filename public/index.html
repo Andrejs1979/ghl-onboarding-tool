@@ -150,7 +150,24 @@
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const data = Object.fromEntries(new FormData(form));
+      const raw = Object.fromEntries(new FormData(form));
+      // Map form field names to API field names — server also handles this,
+      // but send canonical names for clarity
+      const data = {
+        businessName:       raw['Company Name'],
+        clientEmail:        raw['Email'],
+        clientPhone:        raw['Phone'],
+        website:            raw['Website'],
+        address:            raw['Company Address'],
+        fromName:           [raw['First Name'], raw['Last Name']].filter(Boolean).join(' '),
+        fromEmail:          raw['Email'],
+        offerFolderUrl:     raw['Offer & Product Google Drive Link'],
+        backendFolderUrl:   raw['Backend Engine Google Drive Folder'],
+        silentSaleFolderUrl: raw['Silent Sale Machine Drive Folder'],
+        domain:             raw['Domain Name'],
+        price:              raw['Price'],
+        vslLink:            raw['VSL Link'],
+      };
 
       submitBtn.disabled = true;
       submitBtn.textContent = 'Starting...';
@@ -184,13 +201,14 @@
       submitBtn.disabled = false;
       submitBtn.textContent = '🚀 Start Onboarding';
 
-      if (job.status === 'complete') {
+      if (job.status === 'complete' || job.status === 'complete_partial') {
         badge.className = 'badge badge-complete';
-        badge.textContent = '✅ Complete';
+        badge.textContent = job.status === 'complete' ? '✅ Complete' : '⚠ Partial';
 
         if (job.result && job.result.locationUrl) {
           resultUrlDiv.style.display = 'block';
-          const label = document.createTextNode('✅ Funnel built! ');
+          while (resultUrlDiv.firstChild) resultUrlDiv.removeChild(resultUrlDiv.firstChild);
+          const label = document.createTextNode(job.status === 'complete' ? '✅ Funnel built! ' : '⚠ Sub-account created — ');
           const link = document.createElement('a');
           link.href = job.result.locationUrl;
           link.target = '_blank';
@@ -200,6 +218,14 @@
           link.style.fontWeight = '600';
           resultUrlDiv.appendChild(label);
           resultUrlDiv.appendChild(link);
+          if (job.result.needsLocationToken) {
+            const note = document.createElement('div');
+            note.style.marginTop = '8px';
+            note.style.fontSize = '13px';
+            note.style.color = '#666';
+            note.textContent = '🔑 Paste a sub-account token to finish setup.';
+            resultUrlDiv.appendChild(note);
+          }
         }
       } else {
         badge.className = 'badge badge-error';

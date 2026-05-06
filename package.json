@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "onboard": "node onboard.js"
+    "onboard": "node onboard.js",
+    "build:worker": "esbuild src/worker.js --bundle --outfile=dist/worker.mjs --format=esm --minify",
+    "deploy": "npm run build:worker && wrangler deploy"
   },
   "dependencies": {
     "express": "^4.18.2",
